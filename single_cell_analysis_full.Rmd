@@ -1,0 +1,163 @@
+
+---
+title: "Single-cell RNA-seq Analysis"
+author: Aaqib Sohail
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+```{r libraries}
+library(Seurat)
+library(harmony)
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+library(ggpubr)
+library(reshape2)
+library(clusterProfiler)
+```
+
+# Quality Control and Clustering
+```{r clustering}
+scRNAlist <- SplitObject(Mariner, split.by = "orig.ident")
+
+for (i in 1:length(scRNAlist)) {
+  scRNAlist[[i]] <- NormalizeData(scRNAlist[[i]], verbose = FALSE)
+  scRNAlist[[i]] <- FindVariableFeatures(scRNAlist[[i]], selection.method = "vst", 
+                                         nfeatures = 2000, verbose = FALSE)
+}
+
+features <- SelectIntegrationFeatures(object.list = scRNAlist)
+Mariner <- merge(scRNAlist[[1]], y = c(scRNAlist[[2]], scRNAlist[[3]]), add.cell.ids = c("M1", "M2", "M3"))
+Mariner <- ScaleData(Mariner, verbose = FALSE)
+
+Mariner <- RunPCA(Mariner, npcs = 50, verbose = FALSE)
+ElbowPlot(Mariner)
+```
+
+# Harmony Integration and UMAP
+```{r harmony}
+Mariner <- RunHarmony(Mariner, group.by.vars = "orig.ident", verbose = FALSE)
+harmony_embeddings <- Embeddings(Mariner, "harmony")
+Mariner <- RunUMAP(Mariner, reduction = "harmony", dims = 1:50)
+Mariner <- FindNeighbors(Mariner, reduction = "harmony", dims = 1:50)
+Mariner <- FindClusters(Mariner, resolution = 0.5)
+DimPlot(Mariner, reduction = "umap", label = TRUE)
+```
+
+# Doublet Detection
+```{r doublet_detection}
+library(scDblFinder)
+sce <- as.SingleCellExperiment(Mariner)
+sce <- scDblFinder(sce)
+Mariner$scDblFinder.class <- sce$scDblFinder.class
+Mariner <- subset(Mariner, subset = scDblFinder.class == "singlet")
+DimPlot(Mariner, reduction = "umap", group.by = "orig.ident", split.by = "orig.ident")
+```
+
+# Cell Cycle Scoring
+```{r cell_cycle}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+Mariner <- CellCycleScoring(Mariner, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+```
+
+# Marker Identification
+```{r markers}
+DefaultAssay(Mariner) <- "RNA"
+markers <- FindAllMarkers(Mariner, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+head(markers)
+```
+
+# Mast Cell Subclustering
+```{r mast_cell_subclustering}
+Idents(Mariner)<-'Cell.ID'
+DimPlot(Mariner, label = T)
+mastC <- subset(Mariner, idents = "Mast cell")
+set.seed(1000)
+
+mastC <- NormalizeData(mastC) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA(verbose = FALSE)
+mastC <- CellCycleScoring(mastC, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+mastC <- RunHarmony(mastC, group.by.vars = c("orig.ident"))
+ElbowPlot(mastC, ndims = 50, reduction = 'harmony')
+
+mastC <- FindNeighbors(mastC, reduction = 'harmony', dims = 1:50) 
+mastC <- RunUMAP(mastC, reduction = 'harmony', dims = 1:50)
+mastC <- FindClusters(mastC, resolution = .5)
+
+DimPlot(mastC, split.by = "orig.ident", ncol = 3)
+```
+
+# Mast Cell Marker Analysis
+```{r mast_cell_marker_analysis}
+FeaturePlot(mastC, )
+pt <- table(Idents(mastC), mastC$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_bw(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = brewer.pal(12, "Paired")) +
+  theme(legend.title = element_blank())
+
+DoHeatmap(mastC, features = c ("DNAJB4", "HSPA1A","HSPH1", "HSPA1B", "HSP90AA1", "HSPH1"), group.by = "orig.ident")
+FeaturePlot(mastC, features = c ("TPSAB1", "GPR183", "IL17RB",  "CMA1"), ncol =4)
+
+T2 = c("IL17RB", "CPA3", "DNASE1L3", "TNFSF14",
+       "IL1B", "CXCR2", "IL5", "IL4", "IL13", "GPR183", "CTSG", "CMA1",
+       "CCL2", "CCL3", "PTGS2")
+
+mastC$Mtd_ID <- paste(Idents(mastC), mastC$orig.ident, sep = "_")
+mastC$celltype <- Idents(mastC)
+Idents(mastC) <- "Mtd_ID"
+levels(mastC)
+```
+
+# Mast Cell Activation Analysis
+```{r mast_cell_activation_analysis}
+il33 <- GOBP_MAST_CELL_ACTIVATION$GO_0045576
+avg.mastC <- AverageExpression(mastC, return.seurat = TRUE, group.by = "orig.ident")
+DoHeatmap(avg.mastC, features = il33)
+DotPlot(mastC, features = il33, assay = "RNA", group.by = "orig.ident")
+avg.mastC <- AverageExpression(mastC, return.seurat = TRUE, group.by = "orig.ident")
+mat <- GetAssayData(avg.mastC, assay="RNA", slot="scale.data")
+counts <- as.matrix(mat[rownames(mat) %in% il33, ])
+il33 <- il33[! il33 %in% c("CPLX2")]
+
+mastC[["IL33act"]] <- PercentageFeatureSet(object = mastC, features = T2)
+AverageExpression(mastC, features = "IL33act", group.by = "orig.ident")
+
+VlnPlot(mastC, features = "IL33act", group.by = "orig.ident")
+
+library(pheatmap)
+pheatmap(counts, cluster_cols = F)
+
+ag <- data.frame(AggregateExpression(object = mastC, group.by = "orig.ident"))
+ava <- data.frame(AverageExpression(object = mastC, slot = "scale.data", group.by = "orig.ident"))
+```
+
+# Statistical Analysis
+```{r statistical_analysis}
+avg.t.cells <- as.data.frame(log1p(AverageExpression(mastC, slot = "data", group.by = "orig.ident", verbose = FALSE)$RNA))
+avg.t.cells$gene <- rownames(avg.t.cells)
+modelM2 <- lm(M1 ~ M3, avg.t.cells)
+summary(modelM2)$adj.r.squared
+
+p1 <- VlnPlot(object = mastC, features = c("IL33act"),ncol = 1, assay = "RNA", group.by = "orig.ident", pt.size = 0.5, raster = NULL)  +
+  NoLegend() +
+  geom_boxplot(width=0.1, fill="white") + labs(title = "Mast cell activation")
+
+table <- p1$data
+library(data.table)
+setDT(table)[,list(Mean=mean(IL33act), Max=max(IL33act), Min=min(IL33act), Median=as.numeric(median(IL33act)), Std=sd(IL33act)), by=ident]
+
+table %>% group_by(ident) %>% get_summary_stats(IL33act, type = "mean_sd")
+```
